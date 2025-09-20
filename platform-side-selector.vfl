@@ -1,0 +1,186 @@
+// --- Platform Side Selector ---
+// Refactored for stability, readability, and maintainability.
+//
+// CHANGE LOG:
+// - DEPRECATED: Removed `use_fast_noise` parameter. The multi-octave noise
+//   loop now handles the single-octave case when `noise_octaves` is set to 1.
+// - REFACTOR: Introduced string constants for group names to improve maintainability.
+// - REFACTOR: Unified noise generation into a single, scalable loop.
+// - DOCS: Added inline comments to clarify complex logic and design choices.
+
+// === CONSTANTS ===
+// Using constants for group names prevents typos and makes future changes easier.
+string SIDE_GROUP    = "plat_sides";
+string TOP_GROUP     = "plat_top";
+string BOTTOM_GROUP  = "plat_bottom";
+string ALL_GROUP     = "plat_all";
+
+// === PARAMETERS ===
+// --- Core Selection ---
+float seed              = chf("seed", 0.0);
+float probability       = chf("probability", 0.5);
+float side_bias         = chf("side_bias", 0.1);
+float top_bias          = chf("top_bias", 0.8);
+
+// --- Spatial Controls ---
+float edge_fade         = chf("edge_fade", 1.0);
+float height_fade       = chf("height_fade", 1.0);
+float height_center     = chf("height_center", 0.0);
+float radial_power      = chf("radial_power", 1.0);
+
+// --- Noise Controls ---
+float noise_scale       = chf("noise_scale", 1.0);
+float noise_amount      = chf("noise_amount", 0.1);
+int   noise_octaves     = chi("noise_octaves", 3);
+float noise_roughness   = chf("noise_roughness", 0.5);
+
+// --- Selection Modes ---
+int select_top          = chi("select_top", 1);
+int select_bottom       = chi("select_bottom", 0);
+int use_curvature       = chi("use_curvature", 0);
+int inverse_selection   = chi("inverse_selection", 0);
+
+// --- Debugging ---
+int enable_debug        = chi("enable_debug", 1);
+
+// === EARLY EXIT FOR PERFORMANCE ===
+// If no selection is possible, exit immediately to avoid unnecessary calculations.
+if (probability <= 0 && !select_top && !select_bottom) return;
+
+// === GEOMETRY DATA ===
+vector N    = normalize(v@N); // Ensure normals are normalized for accurate dot products.
+vector P    = v@P;
+int    pnum = @primnum;
+
+// === INITIALIZE GROUPS ===
+// Explicitly clear groups at the start to ensure a clean state on each run.
+setprimgroup(0, SIDE_GROUP, pnum, 0);
+setprimgroup(0, TOP_GROUP, pnum, 0);
+setprimgroup(0, BOTTOM_GROUP, pnum, 0);
+setprimgroup(0, ALL_GROUP, pnum, 0);
+
+// === OPTIMIZED CALCULATIONS ===
+// Cache frequently used values to avoid redundant computation.
+float ny         = N.y;
+float ny_abs     = abs(ny);
+float px2_pz2    = P.x*P.x + P.z*P.z; // Avoid sqrt until necessary for distance check.
+
+// --- Directional Scores ---
+// Calculate the primitive's orientation.
+float side_score   = 1.0 - ny_abs;
+float top_score    = max(0, ny);
+float bottom_score = max(0, -ny);
+
+// === SPATIAL MASKS ===
+// --- Edge Mask ---
+// Creates a radial fade from the center of the platform.
+float edge_mask = 1.0;
+if (edge_fade > 0) {
+    float edge_dist = sqrt(px2_pz2);
+    // The power function provides artistic control over the fade's curve.
+    edge_dist       = pow(edge_dist / edge_fade, radial_power);
+    edge_mask       = 1.0 - clamp(edge_dist, 0, 1);
+}
+
+// --- Height Mask ---
+// Creates a vertical fade from a specified center height.
+float height_mask = 1.0;
+if (height_fade > 0) {
+    float height_dist = abs(P.y - height_center) / height_fade;
+    height_mask     = 1.0 - clamp(height_dist, 0, 1);
+}
+
+// === NOISE CALCULATION ===
+// A single, unified loop for multi-octave noise.
+// If `noise_octaves` is 1, this functions as a simple, single-octave noise.
+float noise_val = 0;
+if (noise_amount > 0 && noise_octaves > 0) {
+    vector noise_pos = P * noise_scale + seed;
+    float amp = 1.0;
+    float freq = 1.0;
+    
+    for (int i = 0; i < noise_octaves; i++) {
+        noise_val += noise(noise_pos * freq) * amp;
+        amp *= noise_roughness; // Amplitude decreases with each octave.
+        freq *= 2.0;            // Frequency doubles with each octave.
+    }
+    noise_val *= noise_amount;
+}
+
+// === CURVATURE MASK (OPTIONAL) ===
+// Uses pre-calculated curvature if the attribute exists.
+float curvature_mask = 1.0;
+if (use_curvature && hasattrib(0, "prim", "curvature")) {
+    float curv   = prim(0, "curvature", pnum);
+    curvature_mask = fit(curv, -1, 1, 0, 1); // Remap curvature to a 0-1 range.
+}
+
+// === COMBINED SCORING ===
+// REFACTOR: Create a single spatial mask from all spatial controls to be used globally.
+float spatial_mask = edge_mask * height_mask * curvature_mask;
+float random_val   = rand(pnum + seed * 1.234) * (1.0 + noise_val);
+
+// Apply inverse if needed. This correctly flips the mask for all selections.
+if (inverse_selection) {
+    spatial_mask = 1.0 - spatial_mask;
+}
+
+// The base score for sides is now correctly calculated using the global spatial mask.
+float base_score = side_score * spatial_mask;
+
+// === SELECTION LOGIC ===
+int selected    = 0;
+vector color    = {0.1, 0.1, 0.1}; // Default color for unselected primitives.
+
+// --- Side Selection ---
+if (probability > 0 && random_val < probability && base_score > side_bias) {
+    setprimgroup(0, SIDE_GROUP, pnum, 1);
+    selected = 1;
+    
+    // Color is interpolated based on the score for visual feedback.
+    color = lerp({0.2, 0.2, 0.8}, {0.8, 0.2, 0.2}, base_score);
+}
+
+// --- Top Selection ---
+// FIX: Top selection now respects the global spatial mask and probability/noise values.
+if (select_top && (top_score * spatial_mask) > top_bias && random_val < probability) {
+    setprimgroup(0, TOP_GROUP, pnum, 1);
+    selected = 1;
+    
+    // The color is blended sequentially. If already a side, this blends on top.
+    float blend = smooth(top_bias, 1.0, top_score * spatial_mask);
+    color = lerp(color, {0.2, 0.8, 0.2}, blend);
+}
+
+// --- Bottom Selection ---
+// FIX: Bottom selection now respects the global spatial mask and probability/noise values.
+if (select_bottom && (bottom_score * spatial_mask) > top_bias && random_val < probability) {
+    setprimgroup(0, BOTTOM_GROUP, pnum, 1);
+    selected = 1;
+    
+    // Final sequential blend for the bottom color.
+    float blend = smooth(top_bias, 1.0, bottom_score * spatial_mask);
+    color = lerp(color, {0.8, 0.8, 0.2}, blend);
+}
+
+// --- Final Grouping and Coloring ---
+if (selected) {
+    setprimgroup(0, ALL_GROUP, pnum, 1);
+    v@Cd = color;
+}
+
+// === DEBUG ATTRIBUTES ===
+// If enabled, write all intermediate scores and values to attributes
+// for inspection in the geometry spreadsheet.
+if (enable_debug) {
+    f@side_score      = side_score;
+    f@top_score       = top_score;
+    f@bottom_score    = bottom_score;
+    f@edge_mask       = edge_mask;
+    f@height_mask     = height_mask;
+    f@curvature_mask  = curvature_mask;
+    f@base_score      = base_score;
+    f@noise_val       = noise_val;
+    f@random_val      = random_val;
+    i@selected        = selected;
+}
